@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -157,6 +158,28 @@ func (s *Store) List(f Filter) ([]*Run, error) {
 	return out, nil
 }
 
+// LastRuns returns the newest run of each named agent in one newest-first
+// pass, stopping as soon as every agent has been seen.
+func (s *Store) LastRuns(agents []string) map[string]*Run {
+	out := map[string]*Run{}
+	want := map[string]bool{}
+	for _, a := range agents {
+		want[a] = true
+	}
+	ids, _ := s.IDs()
+	for _, id := range ids {
+		if len(out) == len(want) {
+			break
+		}
+		r, err := s.Load(id)
+		if err != nil || !want[r.Agent] || out[r.Agent] != nil {
+			continue
+		}
+		out[r.Agent] = r
+	}
+	return out
+}
+
 // Prune deletes terminal runs beyond the newest retain, and those older than
 // retainDays. Zero disables that limit. keep lists IDs that must survive.
 func (s *Store) Prune(retain, retainDays int, now time.Time, keep []string) (int, error) {
@@ -190,7 +213,9 @@ func (s *Store) Prune(retain, retainDays int, now time.Time, keep []string) (int
 }
 
 // ReadEvents reads events.jsonl.
-func (s *Store) ReadEvents(id string) ([]Event, error) {
+func (s *Store) ReadEvents(id string) ([]Event, error) { return s.readEvents(id, 0, false) }
+
+func (s *Store) readEvents(id string, limit int64, limited bool) ([]Event, error) {
 	f, err := os.Open(filepath.Join(s.Dir(id), EventsFile))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -199,8 +224,12 @@ func (s *Store) ReadEvents(id string) ([]Event, error) {
 		return nil, err
 	}
 	defer f.Close()
+	var r io.Reader = f
+	if limited {
+		r = io.LimitReader(f, limit)
+	}
 	var out []Event
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for sc.Scan() {
 		var e Event

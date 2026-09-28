@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,10 @@ import (
 	"github.com/Hunt4Bugs/agentsd/internal/client"
 	"github.com/Hunt4Bugs/agentsd/internal/env"
 	"github.com/Hunt4Bugs/agentsd/internal/exitcode"
+	"github.com/Hunt4Bugs/agentsd/internal/ledger"
+	"github.com/Hunt4Bugs/agentsd/internal/manifest"
+	"github.com/Hunt4Bugs/agentsd/internal/runstore"
+	"github.com/Hunt4Bugs/agentsd/internal/supervisor"
 	"github.com/Hunt4Bugs/agentsd/internal/xdg"
 )
 
@@ -136,3 +141,55 @@ func TestPeerUIDCheck(t *testing.T) {
 }
 
 func apiReq(agent string) api.StartRunRequest { return api.StartRunRequest{Agent: agent} }
+
+func TestFollowResumesAfterTruncation(t *testing.T) {
+	old := supervisor.SubscriberBuffer
+	supervisor.SubscriberBuffer = 4
+	defer func() { supervisor.SubscriberBuffer = old }()
+
+	e := testEnv(t)
+	l, _ := ledger.Load(e.Dirs.State())
+	l.Agents["chatty"] = &manifest.Resolved{
+		Name: "chatty", Runtime: "exec", MaxConcurrent: 1, Timeout: manifest.Duration(time.Minute),
+		Command: []string{"/bin/sh", "-c", "sleep 0.3; i=0; while [ $i -lt 500 ]; do echo line$i; i=$((i+1)); done"},
+		Read:    []string{}, Write: []string{}, EnvPass: []string{}, EnvSet: map[string]string{}, Args: []string{},
+		OutRoot: filepath.Join(e.Home, "out", "chatty"),
+	}
+	if err := l.Save(e.Dirs.State()); err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := startDaemon(t, e)
+	defer func() { cancel(); <-done }()
+
+	c := client.New(e.SocketPath)
+	run, err := c.StartRun(context.Background(), apiReq("chatty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	var end *runstore.Event
+	err = c.Follow(context.Background(), run.ID, func(ev runstore.Event) error {
+		switch ev.Type {
+		case runstore.EvOutput:
+			lines = append(lines, ev.Data["line"].(string))
+			time.Sleep(time.Millisecond) // slow consumer
+		case runstore.EvStreamEnd:
+			end = &ev
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end == nil || end.Data["status"] != "succeeded" {
+		t.Fatalf("no stream.end with final status: %+v", end)
+	}
+	if len(lines) != 500 {
+		t.Fatalf("got %d lines, want 500", len(lines))
+	}
+	for i, l := range lines {
+		if l != fmt.Sprintf("line%d", i) {
+			t.Fatalf("line %d = %q (duplicate or gap)", i, l)
+		}
+	}
+}

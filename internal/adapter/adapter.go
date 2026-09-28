@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/Hunt4Bugs/agentsd/internal/config"
 	"github.com/Hunt4Bugs/agentsd/internal/manifest"
@@ -99,6 +100,9 @@ func Build(r *manifest.Resolved, cfg *config.Config, rc RunContext) (ProcSpec, e
 			tmpl = DefaultArgv[r.Runtime]
 		}
 		hasPrompt := slices.Contains(tmpl, "{prompt}")
+		// A prompt starting with "-" would be parsed as a flag (and could
+		// inject options the manifest never granted), so it goes on stdin.
+		viaStdin := rc.PromptStdin || strings.HasPrefix(rc.Prompt, "-")
 		for _, a := range tmpl {
 			switch a {
 			case "{command}":
@@ -106,7 +110,7 @@ func Build(r *manifest.Resolved, cfg *config.Config, rc RunContext) (ProcSpec, e
 			case "{args...}":
 				spec.Argv = append(spec.Argv, r.Args...)
 			case "{prompt}":
-				if !rc.PromptStdin {
+				if !viaStdin {
 					spec.Argv = append(spec.Argv, rc.Prompt)
 				} else if s := stdinPromptArg[r.Runtime]; s != "" {
 					spec.Argv = append(spec.Argv, s)
@@ -115,7 +119,7 @@ func Build(r *manifest.Resolved, cfg *config.Config, rc RunContext) (ProcSpec, e
 				spec.Argv = append(spec.Argv, a)
 			}
 		}
-		if rc.PromptStdin || !hasPrompt {
+		if viaStdin || !hasPrompt {
 			spec.Stdin, spec.HasStdin = rc.Prompt, true
 		}
 	default:

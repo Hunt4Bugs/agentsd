@@ -33,7 +33,14 @@ const (
 	DefaultStopGrace = 10 * time.Second
 	// outputDrain bounds how long we wait for grandchildren holding the pipes.
 	outputDrain = 5 * time.Second
+	// groupReapGrace is how long leftover process-group members get between
+	// SIGTERM and SIGKILL after the main process exits.
+	groupReapGrace = 2 * time.Second
 )
+
+// errStoppedBeforeStart means a stop (or shutdown) arrived while the run was
+// still being prepared, so its process was never started.
+var errStoppedBeforeStart = errors.New("stopped before the process started")
 
 type Supervisor struct {
 	Store     *runstore.Store
@@ -41,8 +48,10 @@ type Supervisor struct {
 	Log       *slog.Logger
 	DaemonPID int
 	LookupEnv func(string) (string, bool)
-	// ScanLimits override policy scan bounds (tests).
+	// ScanMaxTime overrides the policy scan time bound (tests).
 	ScanMaxTime time.Duration
+	// beforeStart, when set, runs just before the process is started (tests).
+	beforeStart func(runID string)
 
 	mu        sync.Mutex
 	cfg       *config.Config
@@ -148,10 +157,14 @@ func (s *Supervisor) Start(req StartRequest) (*runstore.Run, error) {
 
 	sink.Emit(runstore.NewEvent(id, runstore.EvCreated, now, createdData(r)))
 	if err := s.launch(p, cfg, timeout); err != nil {
-		s.finishFailedStart(p, err)
-		return r, exitcode.Wrap(exitcode.CodeRunFailed, err, "start run")
+		if errors.Is(err, errStoppedBeforeStart) {
+			s.finishWithoutProcess(p, runstore.Stopped, err)
+			return s.snapshot(p), nil
+		}
+		s.finishWithoutProcess(p, runstore.Failed, err)
+		return s.snapshot(p), exitcode.Wrap(exitcode.CodeRunFailed, err, "start run")
 	}
-	return snapshot(p), nil
+	return s.snapshot(p), nil
 }
 
 // admitLocked applies the hard preconditions: accepting, cwd policy (§8.1),
@@ -226,13 +239,23 @@ func (s *Supervisor) launch(p *proc, cfg *config.Config, timeout time.Duration) 
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = outputDrain
-	p.launchedAt = policy.FSNow(s.Dirs.State())
+	launchedAt := policy.FSNow(s.Dirs.State())
+	if s.beforeStart != nil {
+		s.beforeStart(r.ID)
+	}
+
+	// Hold the lock across Start so that Stop and Shutdown either see the
+	// process or see that it was never started.
+	s.mu.Lock()
+	if p.stopReq || !s.accepting {
+		s.mu.Unlock()
+		return errStoppedBeforeStart
+	}
 	if err := cmd.Start(); err != nil {
+		s.mu.Unlock()
 		return err
 	}
-	p.cmd = cmd
-
-	s.mu.Lock()
+	p.cmd, p.launchedAt = cmd, launchedAt
 	started := time.Now().UTC()
 	r.Status, r.StartedAt, r.PID, r.PGID = runstore.Running, &started, cmd.Process.Pid, cmd.Process.Pid
 	_ = s.Store.Save(r)
@@ -268,6 +291,9 @@ func lookPath(name string, env []string) (string, error) {
 
 func (s *Supervisor) wait(p *proc, stdout, stderr *lineWriter) {
 	err := p.cmd.Wait()
+	// Leftover members of the run's process group (background helpers,
+	// grandchildren holding the pipes) must not outlive the run untracked.
+	reaped := reapGroup(p.cmd.Process.Pid)
 	stdout.Finish()
 	stderr.Finish()
 	ended := time.Now().UTC()
@@ -303,6 +329,9 @@ func (s *Supervisor) wait(p *proc, stdout, stderr *lineWriter) {
 	}
 	if sig != "" {
 		data["signal"] = sig
+	}
+	if reaped {
+		data["group_reaped"] = true
 	}
 	p.sink.Emit(runstore.NewEvent(r.ID, runstore.EvExited, ended, data))
 	switch r.Status {
@@ -361,18 +390,46 @@ func (s *Supervisor) scanInputLocked(p *proc) scanInput {
 	return in
 }
 
-func (s *Supervisor) finishFailedStart(p *proc, err error) {
+// finishWithoutProcess records a run that ends before its process started.
+func (s *Supervisor) finishWithoutProcess(p *proc, status runstore.Status, err error) {
 	s.mu.Lock()
 	ended := time.Now().UTC()
-	p.run.Status, p.run.Reason, p.run.EndedAt = runstore.Failed, err.Error(), &ended
+	p.run.Status, p.run.Reason, p.run.EndedAt = status, err.Error(), &ended
 	_ = s.Store.Save(p.run)
 	delete(s.active, p.run.ID)
 	s.mu.Unlock()
-	p.sink.Emit(runstore.NewEvent(p.run.ID, runstore.EvExited, ended, map[string]any{"error": err.Error()}))
+	typ := runstore.EvExited
+	if status == runstore.Stopped {
+		typ = runstore.EvStopped
+	}
+	p.sink.Emit(runstore.NewEvent(p.run.ID, typ, ended, map[string]any{"error": err.Error()}))
 	p.sink.Close()
 	close(p.done)
 	s.wg.Done()
-	s.Log.Error("run failed to start", "run", p.run.ID, "err", err)
+	if status == runstore.Stopped {
+		s.Log.Info("run stopped before its process started", "run", p.run.ID)
+	} else {
+		s.Log.Error("run failed to start", "run", p.run.ID, "err", err)
+	}
+}
+
+// reapGroup terminates any processes left in the group pgid after its leader
+// exited: SIGTERM, then SIGKILL after groupReapGrace. It reports whether any
+// were found.
+func reapGroup(pgid int) bool {
+	if syscall.Kill(-pgid, 0) != nil {
+		return false
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(groupReapGrace)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(-pgid, 0) != nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	return true
 }
 
 func (s *Supervisor) onTimeout(p *proc) {
@@ -411,12 +468,10 @@ func (s *Supervisor) Stop(id string, grace time.Duration) (*runstore.Run, error)
 		}
 		return r, exitcode.New(exitcode.CodeInvalid, "run %s is not active (status %s)", id, r.Status)
 	}
-	if p.cmd == nil {
-		s.mu.Unlock()
-		return nil, exitcode.New(exitcode.CodeInvalid, "run %s has not started yet", id)
-	}
 	p.stopReq = true
-	s.terminateLocked(p, grace)
+	if p.cmd != nil {
+		s.terminateLocked(p, grace)
+	} // else: launch sees stopReq and never starts the process.
 	r := *p.run
 	s.mu.Unlock()
 	s.Log.Info("run stop requested", "run", id, "grace", grace)
@@ -434,15 +489,15 @@ func (s *Supervisor) Done(id string) <-chan struct{} {
 }
 
 // Subscribe follows an active run. ok is false when the run is not active.
-func (s *Supervisor) Subscribe(id string) (replay []runstore.Event, ch <-chan runstore.Event, cancel func(), ok bool) {
+func (s *Supervisor) Subscribe(id string) (replay []runstore.Event, sub *Subscription, ok bool) {
 	s.mu.Lock()
 	p, found := s.active[id]
 	s.mu.Unlock()
 	if !found {
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
-	replay, ch, cancel = p.sink.Subscribe()
-	return replay, ch, cancel, true
+	replay, sub = p.sink.Subscribe()
+	return replay, sub, true
 }
 
 // Get returns a copy of an active run's current state.
@@ -479,10 +534,10 @@ func (s *Supervisor) Shutdown(grace time.Duration) {
 	s.mu.Lock()
 	s.accepting = false
 	for _, p := range s.active {
-		if p.cmd != nil && !p.run.Status.Terminal() {
-			p.stopReq = true
+		p.stopReq = true
+		if p.cmd != nil {
 			s.terminateLocked(p, grace)
-		}
+		} // else: launch sees !accepting and never starts the process.
 	}
 	s.mu.Unlock()
 	done := make(chan struct{})
@@ -533,7 +588,9 @@ func createdData(r *runstore.Run) map[string]any {
 	return d
 }
 
-func snapshot(p *proc) *runstore.Run {
+func (s *Supervisor) snapshot(p *proc) *runstore.Run {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	r := *p.run
 	return &r
 }

@@ -9,97 +9,155 @@ import (
 	"github.com/Hunt4Bugs/agentsd/internal/runstore"
 )
 
-// subBuffer is how many events a follower may lag behind before it is cut off.
-const subBuffer = 8192
+// SubscriberBuffer is how many events a follower may lag behind before it is
+// cut off (it can then resume). A variable so tests can shrink it.
+var SubscriberBuffer = 8192
 
-// Sink serializes everything a run writes (events and output lines) so that a
-// follower can atomically replay what is on disk and then receive live events
-// without gaps or duplicates.
+// Sink serializes everything a run writes (events and output lines). Each item
+// gets a strictly increasing timestamp and a sequence number, so a replay
+// sorted by time reproduces emission order and a follower can resume after
+// the last seq it saw.
 type Sink struct {
-	mu     sync.Mutex
-	store  *runstore.Store
-	id     string
-	events *os.File
-	logs   map[string]*os.File
-	subs   map[chan runstore.Event]struct{}
-	closed bool
+	mu      sync.Mutex
+	store   *runstore.Store
+	id      string
+	files   map[string]*os.File // by file name
+	written map[string]int64    // bytes written per file name
+	subs    map[*subscriber]struct{}
+	seq     int64
+	last    time.Time
+	closed  bool
+}
+
+type subscriber struct {
+	ch        chan runstore.Event
+	truncated bool
+}
+
+// Subscription is a live follower of one run.
+type Subscription struct {
+	sink *Sink
+	sub  *subscriber
+}
+
+// C yields live events; it is closed when the stream ends or the follower is
+// cut off (see Truncated).
+func (s *Subscription) C() <-chan runstore.Event { return s.sub.ch }
+
+// Truncated reports whether the follower was cut off for falling behind.
+func (s *Subscription) Truncated() bool {
+	s.sink.mu.Lock()
+	defer s.sink.mu.Unlock()
+	return s.sub.truncated
+}
+
+// Cancel unsubscribes.
+func (s *Subscription) Cancel() {
+	s.sink.mu.Lock()
+	defer s.sink.mu.Unlock()
+	if _, ok := s.sink.subs[s.sub]; ok {
+		delete(s.sink.subs, s.sub)
+		close(s.sub.ch)
+	}
 }
 
 func openSink(store *runstore.Store, id string) (*Sink, error) {
-	dir := store.Dir(id)
-	open := func(name string) (*os.File, error) {
-		return os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	}
-	ev, err := open(runstore.EventsFile)
-	if err != nil {
-		return nil, err
-	}
-	s := &Sink{store: store, id: id, events: ev, logs: map[string]*os.File{}, subs: map[chan runstore.Event]struct{}{}}
-	for stream, name := range map[string]string{runstore.Stdout: runstore.StdoutFile, runstore.Stderr: runstore.StderrFile} {
-		f, err := open(name)
+	s := &Sink{store: store, id: id, files: map[string]*os.File{}, written: map[string]int64{}, subs: map[*subscriber]struct{}{}}
+	for _, name := range []string{runstore.EventsFile, runstore.StdoutFile, runstore.StderrFile} {
+		f, err := os.OpenFile(filepath.Join(store.Dir(id), name), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
-		s.logs[stream] = f
+		s.files[name] = f
+		if fi, err := f.Stat(); err == nil {
+			s.written[name] = fi.Size()
+		}
 	}
 	return s, nil
 }
 
-// Emit persists an event and broadcasts it.
+// stamp returns a strictly increasing UTC time.
+func (s *Sink) stamp() time.Time {
+	t := time.Now().UTC()
+	if !t.After(s.last) {
+		t = s.last.Add(time.Nanosecond)
+	}
+	s.last = t
+	return t
+}
+
+func (s *Sink) write(name, data string) {
+	n, _ := s.files[name].WriteString(data)
+	s.written[name] += int64(n)
+}
+
+// Emit persists an event and broadcasts it. Its timestamp is assigned here.
 func (s *Sink) Emit(e runstore.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	_, _ = s.events.Write(append(e.JSON(), '\n'))
+	e.TS = s.stamp().Format(runstore.TimeFormat)
+	s.seq++
+	e.Seq = s.seq
+	s.write(runstore.EventsFile, string(e.JSON())+"\n")
 	s.broadcast(e)
 }
 
 // Output persists one output line and broadcasts it as run.output.
-func (s *Sink) Output(stream string, t time.Time, line string) {
+func (s *Sink) Output(stream, line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	_, _ = s.logs[stream].WriteString(runstore.FormatLogLine(t, line))
-	s.broadcast(runstore.OutputEvent(s.id, t, stream, line))
+	t := s.stamp()
+	name := runstore.StdoutFile
+	if stream == runstore.Stderr {
+		name = runstore.StderrFile
+	}
+	s.write(name, runstore.FormatLogLine(t, line))
+	s.seq++
+	e := runstore.OutputEvent(s.id, t, stream, line)
+	e.Seq = s.seq
+	s.broadcast(e)
 }
 
 func (s *Sink) broadcast(e runstore.Event) {
-	for ch := range s.subs {
+	for sub := range s.subs {
 		select {
-		case ch <- e:
+		case sub.ch <- e:
 		default:
-			// Too slow: cut the follower off rather than stall the run.
-			delete(s.subs, ch)
-			close(ch)
+			// Too slow: cut the follower off rather than stall the run. It
+			// can resume from the last seq it received.
+			sub.truncated = true
+			delete(s.subs, sub)
+			close(sub.ch)
 		}
 	}
 }
 
-// Subscribe returns everything persisted so far plus a channel of subsequent
-// events. The channel is closed when the run's stream ends.
-func (s *Sink) Subscribe() ([]runstore.Event, <-chan runstore.Event, func()) {
+// Subscribe registers a follower and returns everything persisted before it,
+// with no gap or overlap against the live channel. Files are read after the
+// lock is released, up to the offsets recorded while holding it, so the
+// running process never waits on a replay.
+func (s *Sink) Subscribe() ([]runstore.Event, *Subscription) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	replay, _ := s.store.Replay(s.id)
-	ch := make(chan runstore.Event, subBuffer)
+	limits := map[string]int64{}
+	for name, n := range s.written {
+		limits[name] = n
+	}
+	sub := &subscriber{ch: make(chan runstore.Event, SubscriberBuffer)}
 	if s.closed {
-		close(ch)
-		return replay, ch, func() {}
+		close(sub.ch)
+	} else {
+		s.subs[sub] = struct{}{}
 	}
-	s.subs[ch] = struct{}{}
-	return replay, ch, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if _, ok := s.subs[ch]; ok {
-			delete(s.subs, ch)
-			close(ch)
-		}
-	}
+	s.mu.Unlock()
+	replay, _ := s.store.ReplayLimited(s.id, limits)
+	return replay, &Subscription{sink: s, sub: sub}
 }
 
 // Close ends the stream for all followers and closes the files.
@@ -110,14 +168,11 @@ func (s *Sink) Close() {
 		return
 	}
 	s.closed = true
-	for ch := range s.subs {
-		close(ch)
+	for sub := range s.subs {
+		close(sub.ch)
 	}
 	s.subs = nil
-	if s.events != nil {
-		s.events.Close()
-	}
-	for _, f := range s.logs {
+	for _, f := range s.files {
 		f.Close()
 	}
 }

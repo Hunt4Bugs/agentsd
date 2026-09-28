@@ -3,7 +3,9 @@ package supervisor
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -227,24 +229,149 @@ func TestSubscribeReplaysOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	replay, ch, cancel, ok := e.sup.Subscribe(r.ID)
+	replay, sub, ok := e.sup.Subscribe(r.ID)
 	if !ok {
 		t.Fatal("not active")
 	}
-	defer cancel()
+	defer sub.Cancel()
 	var lines []string
-	for _, ev := range replay {
+	var seqs []int64
+	collect := func(ev runstore.Event) {
+		seqs = append(seqs, ev.Seq)
 		if ev.Type == runstore.EvOutput {
 			lines = append(lines, ev.Data["line"].(string))
 		}
 	}
-	for ev := range ch {
-		if ev.Type == runstore.EvOutput {
-			lines = append(lines, ev.Data["line"].(string))
-		}
+	for _, ev := range replay {
+		collect(ev)
+	}
+	for ev := range sub.C() {
+		collect(ev)
 	}
 	if strings.Join(lines, ",") != "early,late" {
 		t.Fatal(lines)
+	}
+	for i, s := range seqs {
+		if s != int64(i+1) {
+			t.Fatalf("seqs not contiguous from 1: %v", seqs)
+		}
+	}
+	// A later full replay numbers events identically.
+	full, _ := e.sup.Store.Replay(r.ID)
+	if int64(len(full)) < seqs[len(seqs)-1] {
+		t.Fatalf("replay has %d events, live stream reached seq %d", len(full), seqs[len(seqs)-1])
+	}
+}
+
+func TestReplayOrderLastOutputBeforeExit(t *testing.T) {
+	e := setup(t)
+	for range 20 {
+		r := e.runToEnd(t, StartRequest{Agent: e.execAgent("x", "echo a; echo b; echo c")})
+		evs, _ := e.sup.Store.Replay(r.ID)
+		exited := -1
+		lastOut := -1
+		for i, ev := range evs {
+			switch ev.Type {
+			case runstore.EvExited:
+				exited = i
+			case runstore.EvOutput:
+				lastOut = i
+			}
+		}
+		if exited < lastOut {
+			t.Fatalf("run.exited (%d) replayed before output (%d): %+v", exited, lastOut, evs)
+		}
+	}
+}
+
+func TestSlowFollowerIsTruncatedNotBlocking(t *testing.T) {
+	old := SubscriberBuffer
+	SubscriberBuffer = 5
+	defer func() { SubscriberBuffer = old }()
+	e := setup(t)
+	r, err := e.sup.Start(StartRequest{Agent: e.execAgent("x", "sleep 0.2; i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sub, _ := e.sup.Subscribe(r.ID)
+	<-e.sup.Done(r.ID) // never reading: the run must still finish
+	for range sub.C() {
+	}
+	if !sub.Truncated() {
+		t.Fatal("slow follower was not marked truncated")
+	}
+	final, _ := e.sup.Store.Load(r.ID)
+	if final.Status != runstore.Succeeded {
+		t.Fatal(final.Status)
+	}
+}
+
+func TestStopDuringLaunchNeverStartsProcess(t *testing.T) {
+	e := setup(t)
+	marker := filepath.Join(e.home, "started")
+	e.sup.beforeStart = func(id string) {
+		if _, err := e.sup.Stop(id, time.Second); err != nil {
+			t.Errorf("stop pending run: %v", err)
+		}
+	}
+	r, err := e.sup.Start(StartRequest{Agent: e.execAgent("x", "touch "+marker+"; sleep 30")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != runstore.Stopped || r.PID != 0 {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("process started despite the stop")
+	}
+	if e.sup.ActiveCount() != 0 {
+		t.Fatal("run left active")
+	}
+}
+
+func TestShutdownDuringLaunchNeverStartsProcess(t *testing.T) {
+	e := setup(t)
+	marker := filepath.Join(e.home, "started")
+	done := make(chan struct{})
+	e.sup.beforeStart = func(string) {
+		go func() { e.sup.Shutdown(time.Second); close(done) }()
+		time.Sleep(50 * time.Millisecond) // let Shutdown take the lock first
+	}
+	r, _ := e.sup.Start(StartRequest{Agent: e.execAgent("x", "touch "+marker+"; sleep 30")})
+	<-done
+	if r == nil || r.Status != runstore.Stopped {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("process started during shutdown")
+	}
+}
+
+func TestLeftoverGroupMembersAreReaped(t *testing.T) {
+	e := setup(t)
+	pidFile := filepath.Join(e.home, "bg.pid")
+	r := e.runToEnd(t, StartRequest{Agent: e.execAgent("x", "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > "+pidFile+"; echo done")})
+	if r.Status != runstore.Succeeded {
+		t.Fatalf("%+v", r)
+	}
+	b, _ := os.ReadFile(pidFile)
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	if pid == 0 {
+		t.Fatal("no background pid")
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatal("background process survived the run")
+	}
+	evs, _ := e.sup.Store.ReadEvents(r.ID)
+	reaped := false
+	for _, ev := range evs {
+		if ev.Type == runstore.EvExited && ev.Data["group_reaped"] == true {
+			reaped = true
+		}
+	}
+	if !reaped {
+		t.Fatal("run.exited does not record group_reaped")
 	}
 }
 

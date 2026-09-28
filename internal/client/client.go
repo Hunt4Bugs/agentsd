@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -116,12 +117,47 @@ func (c *Client) Reload(ctx context.Context) error {
 	return c.Call(ctx, http.MethodPost, "/v1/reload", nil, nil)
 }
 
-// Follow streams a run's events until the run ends, fn returns an error, or
-// ctx is cancelled.
+// Follow streams a run's events until the daemon sends stream.end, fn
+// returns an error, or ctx is cancelled. If the stream breaks off early (the
+// follower fell behind, or the connection dropped) it reconnects and resumes
+// after the last seq it delivered, so fn sees each event once.
 func (c *Client) Follow(ctx context.Context, id string, fn func(runstore.Event) error) error {
-	resp, err := c.do(ctx, http.MethodGet, "/v1/runs/"+url.PathEscape(id)+"/events?follow=1", nil)
+	var last int64
+	failures := 0
+	for {
+		ended, progressed, err := c.followOnce(ctx, id, &last, fn)
+		if ended || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var cbErr callbackError
+		if errors.As(err, &cbErr) {
+			return cbErr.err
+		}
+		if progressed {
+			failures = 0
+		} else if failures++; failures >= 10 {
+			if err == nil {
+				err = exitcode.New(exitcode.CodeInternal, "event stream for run %s keeps ending early", id)
+			}
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(failures) * 200 * time.Millisecond):
+		}
+	}
+}
+
+type callbackError struct{ err error }
+
+func (e callbackError) Error() string { return e.err.Error() }
+
+func (c *Client) followOnce(ctx context.Context, id string, last *int64, fn func(runstore.Event) error) (ended, progressed bool, err error) {
+	path := fmt.Sprintf("/v1/runs/%s/events?follow=1&after=%d", url.PathEscape(id), *last)
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
-		return err
+		return false, false, err
 	}
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
@@ -131,12 +167,25 @@ func (c *Client) Follow(ctx context.Context, id string, fn func(runstore.Event) 
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			continue
 		}
-		if err := fn(e); err != nil {
-			return err
+		switch e.Type {
+		case runstore.EvStreamEnd:
+			if err := fn(e); err != nil {
+				return true, progressed, callbackError{err}
+			}
+			return true, progressed, nil
+		case runstore.EvStreamTruncated:
+			return false, progressed, nil
 		}
+		if e.Seq != 0 && e.Seq <= *last {
+			continue
+		}
+		if err := fn(e); err != nil {
+			return false, progressed, callbackError{err}
+		}
+		if e.Seq > *last {
+			*last = e.Seq
+		}
+		progressed = true
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return sc.Err()
+	return false, progressed, sc.Err()
 }

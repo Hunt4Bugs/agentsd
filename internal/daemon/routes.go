@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/Hunt4Bugs/agentsd/internal/api"
@@ -56,7 +58,7 @@ func decode(r *http.Request, v any) error {
 	if len(body) == 0 {
 		return nil
 	}
-	dec := json.NewDecoder(bytesReader(body))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return exitcode.Wrap(exitcode.CodeUsage, err, "invalid JSON body")
@@ -240,25 +242,50 @@ func (d *Daemon) handleStopRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
-// handleEvents streams NDJSON. Without follow it returns persisted events;
-// with follow it replays events and output, then streams live until the run
-// ends or the client goes away.
+// handleEvents streams NDJSON. Without follow it returns persisted events.
+// With follow it replays events and output, streams live events, and ends
+// with stream.end (run finished) or stream.truncated (this follower fell
+// behind; reconnect with after=<last seq>). after=N skips events up to seq N.
 func (d *Daemon) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id, ok := d.resolveRun(w, r)
 	if !ok {
 		return
 	}
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
+	q := r.URL.Query()
+	follow := q.Get("follow") == "1" || q.Get("follow") == "true"
+	var after int64
+	if v := q.Get("after"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			writeErr(w, exitcode.New(exitcode.CodeUsage, "invalid after %q", v))
+			return
+		}
+		after = n
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	flusher, _ := w.(http.Flusher)
+	var last int64
 	send := func(e runstore.Event) error {
+		if e.Seq != 0 && e.Seq <= after {
+			return nil
+		}
 		if _, err := w.Write(append(e.JSON(), '\n')); err != nil {
 			return err
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
+		if e.Seq > last {
+			last = e.Seq
+		}
 		return nil
+	}
+	end := func() {
+		data := map[string]any{"last_seq": max(last, after)}
+		if run, err := d.store.Load(id); err == nil {
+			data["status"] = run.Status
+		}
+		_ = send(runstore.NewEvent(id, runstore.EvStreamEnd, time.Now(), data))
 	}
 	if !follow {
 		evs, err := d.store.ReadEvents(id)
@@ -272,7 +299,7 @@ func (d *Daemon) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	replay, ch, cancel, active := d.sup.Subscribe(id)
+	replay, sub, active := d.sup.Subscribe(id)
 	if !active {
 		evs, err := d.store.Replay(id)
 		if err != nil {
@@ -281,11 +308,14 @@ func (d *Daemon) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 		for _, e := range evs {
-			_ = send(e)
+			if send(e) != nil {
+				return
+			}
 		}
+		end()
 		return
 	}
-	defer cancel()
+	defer sub.Cancel()
 	w.WriteHeader(http.StatusOK)
 	for _, e := range replay {
 		if send(e) != nil {
@@ -294,8 +324,14 @@ func (d *Daemon) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	for {
 		select {
-		case e, ok := <-ch:
+		case e, ok := <-sub.C():
 			if !ok {
+				if sub.Truncated() {
+					_ = send(runstore.NewEvent(id, runstore.EvStreamTruncated, time.Now(), map[string]any{"last_seq": max(last, after)}))
+					return
+				}
+				// The sink closes only after the final run.json is saved.
+				end()
 				return
 			}
 			if send(e) != nil {

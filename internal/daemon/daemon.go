@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -73,7 +74,7 @@ func Run(ctx context.Context, o Options) error {
 	if diags.HasErrors() {
 		return exitcode.New(exitcode.CodeInvalid, "config is invalid; not starting:\n%s", diags.Errors().Error())
 	}
-	setLevel(level, firstNonEmpty(o.LogLevel, os.Getenv("AGENTSD_LOG_LEVEL"), cfg.Daemon.LogLevel))
+	setLevel(level, cmp.Or(o.LogLevel, os.Getenv("AGENTSD_LOG_LEVEL"), cfg.Daemon.LogLevel))
 	l, err := e.Ledger()
 	if err != nil {
 		return exitcode.Wrap(exitcode.CodeInvalid, err, "read managed.toml")
@@ -189,7 +190,7 @@ func (d *Daemon) reload() error {
 	d.cfg, d.ledger = cfg, l
 	d.mu.Unlock()
 	d.sup.SetConfig(cfg)
-	setLevel(d.level, firstNonEmpty(os.Getenv("AGENTSD_LOG_LEVEL"), cfg.Daemon.LogLevel))
+	setLevel(d.level, cmp.Or(os.Getenv("AGENTSD_LOG_LEVEL"), cfg.Daemon.LogLevel))
 	d.sup.Broadcast(runstore.EvReload, map[string]any{"agents": len(l.Agents)})
 	d.log.Info("reloaded", "agents", len(l.Agents))
 	return nil
@@ -212,13 +213,4 @@ func setLevel(v *slog.LevelVar, name string) {
 	default:
 		v.Set(slog.LevelInfo)
 	}
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

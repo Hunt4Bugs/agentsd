@@ -43,6 +43,20 @@ func TestClaudeArgvAndStdin(t *testing.T) {
 	}
 }
 
+func TestDashPromptGoesToStdin(t *testing.T) {
+	cfg := config.Default()
+	for _, prompt := range []string{"--help", "-v what changed?", "--dangerously-skip-permissions do it"} {
+		s, _ := Build(agent("claude-code"), cfg, rc(prompt, false))
+		if slices.Contains(s.Argv, prompt) || !s.HasStdin || s.Stdin != prompt {
+			t.Errorf("claude %q: argv=%q stdin=%v", prompt, s.Argv, s.HasStdin)
+		}
+		s, _ = Build(agent("codex"), cfg, rc(prompt, false))
+		if strings.Join(s.Argv, " ") != "codex exec - --model x" || s.Stdin != prompt {
+			t.Errorf("codex %q: argv=%q", prompt, s.Argv)
+		}
+	}
+}
+
 func TestArgvOverride(t *testing.T) {
 	cfg := config.Default()
 	cfg.Runtimes["codex"] = config.Runtime{Command: "/opt/codex", Argv: []string{"{command}", "run", "--quiet", "{args...}", "{prompt}"}}

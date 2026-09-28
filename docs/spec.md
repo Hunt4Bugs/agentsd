@@ -20,6 +20,10 @@ Changes made while implementing v0.1. Each is also reflected inline below.
 10. **Socket fallback directory.** `/tmp/agentsd-$UID/` (used only when the preferred socket path is too long) is a third location, alongside the §3.3 service file, that is written outside XDG dirs and AHS roots. `uninstall --purge-state` removes it only when the current environment uses it.
 11. **Rejected runs are recorded.** A run refused by a precondition (cwd policy, runtime unavailable, or concurrency) gets a run directory with status `rejected`, a reason, and the matching exit code.
 12. **Lost runs are not killed.** Their pid and pgid stay in `run.json` for inspection.
+13. **Event timestamps and sequence numbers.** Event `ts` values use nanosecond precision and strictly increase within a run, and every event and output line carries a `seq` number. Replay order therefore matches emission order.
+14. **Resumable follow.** A follower that falls too far behind is cut off rather than stalling the run. The stream then ends with `stream.truncated` (not `stream.end`), and clients reconnect with `?after=<seq>`. A completed stream ends with `stream.end`, which carries the final status. These two control events are sent only to followers and are never persisted.
+15. **Prompts starting with `-`** are passed to `claude-code` and `codex` on stdin, never in argv, so they cannot be parsed as flags.
+16. **The process group ends with the run.** After the main process exits, any processes still in its group get SIGTERM, then SIGKILL 2s later. `run.exited` records `group_reaped: true` when that happens. A stop or daemon shutdown that arrives while a run is still being prepared prevents its process from starting, and the run is recorded as `stopped`.
 
 ## 1. Purpose
 
@@ -411,7 +415,7 @@ HTTP/1.1 with JSON bodies over the Unix socket. The API is versioned under `/v1`
 | GET | `/v1/runs` | List runs (query params mirror `runs list`) |
 | GET | `/v1/runs/{id}` | Run detail |
 | POST | `/v1/runs/{id}/stop` | Stop a run: `{grace?}` |
-| GET | `/v1/runs/{id}/events?follow=1` | NDJSON event stream. With `follow`, it replays persisted events and output, then streams live events until the run ends. |
+| GET | `/v1/runs/{id}/events?follow=1[&after=SEQ]` | NDJSON event stream. With `follow`, it replays persisted events and output, streams live events, and ends with `stream.end` or `stream.truncated`. `after` skips events up to that `seq`. |
 
 Errors use the shape `{"error": {"code": "not_found", "message": "...", "run_id": "..."}}`, and each error code maps to an exit code in §11: `bad_request` 2, `daemon_unreachable` 3, `not_found` 4, `invalid` and `policy` 5, `runtime_unavailable` 7, `concurrency_limit` 8, `internal` 1.
 
@@ -426,10 +430,10 @@ pending → rejected              (policy precondition, runtime unavailable, or 
 ### 12.2 Events (`events.jsonl`)
 
 ```json
-{"ts":"2026-09-28T17:02:11.412Z","run_id":"01J9...","type":"run.started","data":{"pid":5521,"argv0":"claude"}}
+{"ts":"2026-09-28T17:02:11.412345678Z","run_id":"01J9...","seq":2,"type":"run.started","data":{"pid":5521,"argv0":"claude"}}
 ```
 
-Event types: `run.created`, `run.started`, `run.output` (line-level, stream-tagged, only when following), `run.exited`, `run.stopped`, `run.timed_out`, `run.lost`, `policy.violation`, `daemon.reload`. `run.exited` is always emitted when a process ends. `run.stopped` or `run.timed_out` follows it when that is the reason.
+Event types: `run.created`, `run.started`, `run.output` (line-level, stream-tagged, only when following), `run.exited`, `run.stopped`, `run.timed_out`, `run.lost`, `policy.violation`, `daemon.reload`. `run.exited` is always emitted when a process ends. `run.stopped` or `run.timed_out` follows it when that is the reason. Followers also receive the stream-control events `stream.end` and `stream.truncated`, which are not persisted.
 
 ## 13. Installation and distribution
 

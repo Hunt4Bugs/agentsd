@@ -89,3 +89,23 @@ func TestNeverDeletesNonEmptyOrUnmanaged(t *testing.T) {
 		t.Fatal("unmanaged dir removed")
 	}
 }
+
+func TestNestedRemovalInOneApply(t *testing.T) {
+	home, state, cfg, agents := fixture(t)
+	agents[0].Write = []string{filepath.Join(home, "src", "a", "b")}
+	l, _ := ledger.Load(state)
+	if err := Apply(Compute(cfg, agents, l), l, state); err != nil {
+		t.Fatal(err)
+	}
+	l, _ = ledger.Load(state)
+	if err := Apply(Compute(cfg, nil, l), l, state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "src", "a")); !os.IsNotExist(err) {
+		t.Fatal("~/src/a survived; nested removal needed two applies")
+	}
+	l, _ = ledger.Load(state)
+	if p := Compute(cfg, nil, l); !p.Empty() {
+		t.Fatalf("second plan not empty:\n%s", p.Render(home))
+	}
+}

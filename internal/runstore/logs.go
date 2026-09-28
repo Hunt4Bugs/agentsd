@@ -3,6 +3,7 @@ package runstore
 import (
 	"bufio"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -44,7 +45,9 @@ func (s *Store) ReadLogs(id string, streams ...string) ([]Line, error) {
 	return all, nil
 }
 
-func readLog(path, stream string) ([]Line, error) {
+func readLog(path, stream string) ([]Line, error) { return readLogLimited(path, stream, 0, false) }
+
+func readLogLimited(path, stream string, limit int64, limited bool) ([]Line, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -53,8 +56,12 @@ func readLog(path, stream string) ([]Line, error) {
 		return nil, err
 	}
 	defer f.Close()
+	var r io.Reader = f
+	if limited {
+		r = io.LimitReader(f, limit)
+	}
 	var out []Line
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for sc.Scan() {
 		ts, text, ok := strings.Cut(sc.Text(), " ")

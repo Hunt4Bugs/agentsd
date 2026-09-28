@@ -18,7 +18,6 @@ type lineWriter struct {
 	stream string
 	sink   *Sink
 	buf    []byte
-	first  time.Time // arrival of the first byte of buf
 	timer  *time.Timer
 }
 
@@ -29,12 +28,8 @@ func newLineWriter(stream string, sink *Sink) *lineWriter {
 func (w *lineWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	now := time.Now()
 	n := len(p)
 	for len(p) > 0 {
-		if len(w.buf) == 0 {
-			w.first = now
-		}
 		i := bytes.IndexByte(p, '\n')
 		if i < 0 {
 			w.buf = append(w.buf, p...)
@@ -67,7 +62,7 @@ func (w *lineWriter) flushPartial() {
 
 func (w *lineWriter) flushLocked() {
 	line := bytes.TrimSuffix(w.buf, []byte("\r"))
-	w.sink.Output(w.stream, w.first, string(line))
+	w.sink.Output(w.stream, string(line))
 	w.buf = w.buf[:0]
 }
 

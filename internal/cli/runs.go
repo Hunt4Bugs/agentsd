@@ -180,6 +180,12 @@ func (a *App) follow(ctx context.Context, id string, interrupt bool, o followOpt
 }
 
 func (a *App) printEvent(e runstore.Event, o followOpts) {
+	if e.Type == runstore.EvStreamEnd {
+		if a.JSON || o.events {
+			fmt.Fprintln(a.Stdout, string(e.JSON()))
+		}
+		return
+	}
 	if o.events {
 		if e.Type != runstore.EvOutput {
 			fmt.Fprintln(a.Stdout, string(e.JSON()))

@@ -3,6 +3,7 @@
 package env
 
 import (
+	"cmp"
 	"os"
 	"path/filepath"
 
@@ -39,7 +40,7 @@ func Resolve(o Options) (*Env, error) {
 		return nil, err
 	}
 	e := &Env{Home: dirs.Home, Dirs: dirs, ConfigPath: filepath.Join(dirs.Config(), "config.toml")}
-	if v := firstNonEmpty(o.ConfigPath, os.Getenv("AGENTSD_CONFIG")); v != "" {
+	if v := cmp.Or(o.ConfigPath, os.Getenv("AGENTSD_CONFIG")); v != "" {
 		abs, err := filepath.Abs(v)
 		if err != nil {
 			return nil, err
@@ -47,7 +48,7 @@ func Resolve(o Options) (*Env, error) {
 		e.ConfigPath = abs
 	}
 	e.SocketPath, e.SocketFallback = dirs.Socket()
-	if v := firstNonEmpty(o.SocketPath, os.Getenv("AGENTSD_SOCKET")); v != "" {
+	if v := cmp.Or(o.SocketPath, os.Getenv("AGENTSD_SOCKET")); v != "" {
 		abs, err := filepath.Abs(v)
 		if err != nil {
 			return nil, err
@@ -55,15 +56,6 @@ func Resolve(o Options) (*Env, error) {
 		e.SocketPath, e.SocketFallback = abs, false
 	}
 	return e, nil
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func (e *Env) AgentsDir() string               { return config.AgentsDir(e.ConfigPath) }
@@ -95,7 +87,11 @@ func (e *Env) LoadAll() (*config.Config, []*manifest.Resolved, diag.List) {
 // AgentInfos merges manifests on disk with the ledger's registered snapshots.
 // Unregistered ledger entries (manifest removed) are included.
 func AgentInfos(cfg *config.Config, manifests []*manifest.Resolved, l *ledger.Ledger, store *runstore.Store) []api.Agent {
-	var out []api.Agent
+	type entry struct {
+		r   *manifest.Resolved
+		reg string
+	}
+	var entries []entry
 	seen := map[string]bool{}
 	for _, m := range manifests {
 		seen[m.Name] = true
@@ -106,25 +102,34 @@ func AgentInfos(cfg *config.Config, manifests []*manifest.Resolved, l *ledger.Le
 				reg = api.Changed
 			}
 		}
-		out = append(out, info(cfg, m, reg, store))
+		entries = append(entries, entry{m, reg})
 	}
 	for _, a := range l.Registered() {
 		if !seen[a.Name] {
-			out = append(out, info(cfg, a, api.Unregistered, store))
+			entries = append(entries, entry{a, api.Unregistered})
 		}
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.r.Name
+	}
+	last := store.LastRuns(names)
+	out := make([]api.Agent, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, info(cfg, e.r, e.reg, last[e.r.Name]))
 	}
 	return out
 }
 
-func info(cfg *config.Config, r *manifest.Resolved, reg string, store *runstore.Store) api.Agent {
+func info(cfg *config.Config, r *manifest.Resolved, reg string, last *runstore.Run) api.Agent {
 	a := api.Agent{Resolved: r, Registration: reg}
 	if p, err := adapter.Available(r, cfg); err == nil {
 		a.Available, a.RuntimePath = true, p
 	} else {
 		a.Unavailable = err.Error()
 	}
-	if runs, _ := store.List(runstore.Filter{Agent: r.Name, Limit: 1}); len(runs) > 0 {
-		a.LastRun = &api.RunBrief{ID: runs[0].ID, Status: runs[0].Status, CreatedAt: runs[0].CreatedAt}
+	if last != nil {
+		a.LastRun = &api.RunBrief{ID: last.ID, Status: last.Status, CreatedAt: last.CreatedAt}
 	}
 	return a
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -145,15 +146,18 @@ func Compute(cfg *config.Config, agents []*manifest.Resolved, l *ledger.Ledger) 
 			wanted[d] = true
 		}
 	}
-	var removals []Action
-	for _, d := range l.Dirs {
-		if wanted[d.Path] || !isEmptyDir(d.Path) {
+	// Deepest first, so a ledger dir whose only contents are other ledger
+	// dirs being removed is itself removable in the same apply.
+	candidates := slices.Clone(l.Dirs)
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path > candidates[j].Path })
+	removing := map[string]bool{}
+	for _, d := range candidates {
+		if wanted[d.Path] || !emptyExcept(d.Path, removing) {
 			continue
 		}
-		removals = append(removals, Action{Kind: RemoveDir, Path: d.Path, Reason: "no longer needed; empty and created by apply"})
+		removing[d.Path] = true
+		p.Actions = append(p.Actions, Action{Kind: RemoveDir, Path: d.Path, Reason: "no longer needed; empty and created by apply"})
 	}
-	sort.Slice(removals, func(i, j int) bool { return removals[i].Path > removals[j].Path })
-	p.Actions = append(p.Actions, removals...)
 
 	seen := map[string]bool{}
 	for _, a := range agents {
@@ -233,6 +237,25 @@ func missingChain(p string) []string {
 		}
 	}
 	return chain
+}
+
+// emptyExcept reports whether p is a directory containing nothing but
+// entries in removing.
+func emptyExcept(p string, removing map[string]bool) bool {
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !removing[filepath.Join(p, e.Name())] {
+			return false
+		}
+	}
+	return true
 }
 
 func isEmptyDir(p string) bool {
