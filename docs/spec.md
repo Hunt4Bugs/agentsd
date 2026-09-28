@@ -23,7 +23,7 @@ Changes made while implementing v0.1. Each is also reflected inline below.
 13. **Event timestamps and sequence numbers.** Event `ts` values use nanosecond precision and strictly increase within a run, and every event and output line carries a `seq` number. Replay order therefore matches emission order.
 14. **Resumable follow.** A follower that falls too far behind is cut off rather than stalling the run. The stream then ends with `stream.truncated` (not `stream.end`), and clients reconnect with `?after=<seq>`. A completed stream ends with `stream.end`, which carries the final status. These two control events are sent only to followers and are never persisted.
 15. **Prompts starting with `-`** are passed to `claude-code` and `codex` on stdin, never in argv, so they cannot be parsed as flags.
-16. **The process group ends with the run.** After the main process exits, any processes still in its group get SIGTERM, then SIGKILL 2s later. `run.exited` records `group_reaped: true` when that happens. A stop or daemon shutdown that arrives while a run is still being prepared prevents its process from starting, and the run is recorded as `stopped`.
+16. **The process group ends with the run.** After the main process exits, any processes still in its group get SIGTERM, then SIGKILL 2s later. `run.exited` records `group_reaped: true` when that happens. A stop or daemon shutdown that arrives while a run is still being prepared prevents its process from starting. If it arrives while the process is starting, the new process is stopped as soon as it exists. Either way the run is recorded as `stopped`. Once the main process has exited, its status is fixed: a timeout or stop that lands while the group is being cleaned up does not change it.
 
 ## 1. Purpose
 

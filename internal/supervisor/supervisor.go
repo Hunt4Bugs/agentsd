@@ -50,8 +50,9 @@ type Supervisor struct {
 	LookupEnv func(string) (string, bool)
 	// ScanMaxTime overrides the policy scan time bound (tests).
 	ScanMaxTime time.Duration
-	// beforeStart, when set, runs just before the process is started (tests).
-	beforeStart func(runID string)
+	// beforeStart and afterStart, when set, run just before the lock is
+	// taken to start the process and just after cmd.Start returns (tests).
+	beforeStart, afterStart func(runID string)
 
 	mu        sync.Mutex
 	cfg       *config.Config
@@ -61,12 +62,18 @@ type Supervisor struct {
 }
 
 type proc struct {
-	run      *runstore.Run
-	agent    *manifest.Resolved
-	cmd      *exec.Cmd
-	sink     *Sink
-	done     chan struct{}
-	stopReq  bool
+	run     *runstore.Run
+	agent   *manifest.Resolved
+	cmd     *exec.Cmd
+	sink    *Sink
+	done    chan struct{}
+	stopReq bool
+	// stopGrace is the grace for a stop that arrived while the process was
+	// starting; it is applied once Start returns.
+	stopGrace time.Duration
+	// exited is set once the leader has exited: timeouts and stops no longer
+	// apply, and the status reflects how the leader ended.
+	exited   bool
 	timedOut bool
 	killT    *time.Timer
 	timeoutT *time.Timer
@@ -244,18 +251,29 @@ func (s *Supervisor) launch(p *proc, cfg *config.Config, timeout time.Duration) 
 		s.beforeStart(r.ID)
 	}
 
-	// Hold the lock across Start so that Stop and Shutdown either see the
-	// process or see that it was never started.
+	// Check for a stop or shutdown before starting. fork+exec runs outside
+	// the lock; a stop that arrives meanwhile only sets stopReq, which is
+	// honored as soon as Start returns.
 	s.mu.Lock()
 	if p.stopReq || !s.accepting {
 		s.mu.Unlock()
 		return errStoppedBeforeStart
 	}
-	if err := cmd.Start(); err != nil {
+	s.mu.Unlock()
+	startErr := cmd.Start()
+	if s.afterStart != nil {
+		s.afterStart(r.ID)
+	}
+	s.mu.Lock()
+	if startErr != nil {
 		s.mu.Unlock()
-		return err
+		return startErr
 	}
 	p.cmd, p.launchedAt = cmd, launchedAt
+	if p.stopReq || !s.accepting {
+		p.stopReq = true
+		s.terminateLocked(p, p.stopGrace)
+	}
 	started := time.Now().UTC()
 	r.Status, r.StartedAt, r.PID, r.PGID = runstore.Running, &started, cmd.Process.Pid, cmd.Process.Pid
 	_ = s.Store.Save(r)
@@ -291,6 +309,15 @@ func lookPath(name string, env []string) (string, error) {
 
 func (s *Supervisor) wait(p *proc, stdout, stderr *lineWriter) {
 	err := p.cmd.Wait()
+	// The leader has exited: freeze how it ended before reaping, so a timeout
+	// or stop arriving during the reap can't relabel a clean exit.
+	s.mu.Lock()
+	p.exited = true
+	p.timeoutT.Stop()
+	if p.killT != nil {
+		p.killT.Stop()
+	}
+	s.mu.Unlock()
 	// Leftover members of the run's process group (background helpers,
 	// grandchildren holding the pipes) must not outlive the run untracked.
 	reaped := reapGroup(p.cmd.Process.Pid)
@@ -299,10 +326,6 @@ func (s *Supervisor) wait(p *proc, stdout, stderr *lineWriter) {
 	ended := time.Now().UTC()
 
 	s.mu.Lock()
-	p.timeoutT.Stop()
-	if p.killT != nil {
-		p.killT.Stop()
-	}
 	r := p.run
 	r.EndedAt = &ended
 	code, sig := exitInfo(p.cmd.ProcessState, err)
@@ -435,7 +458,7 @@ func reapGroup(pgid int) bool {
 func (s *Supervisor) onTimeout(p *proc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p.cmd == nil || p.run.Status.Terminal() || p.stopReq {
+	if p.cmd == nil || p.exited || p.stopReq {
 		return
 	}
 	p.timedOut = true
@@ -468,11 +491,16 @@ func (s *Supervisor) Stop(id string, grace time.Duration) (*runstore.Run, error)
 		}
 		return r, exitcode.New(exitcode.CodeInvalid, "run %s is not active (status %s)", id, r.Status)
 	}
-	p.stopReq = true
+	r := *p.run
+	if p.exited {
+		// Already finishing; its status reflects how the leader exited.
+		s.mu.Unlock()
+		return &r, nil
+	}
+	p.stopReq, p.stopGrace = true, grace
 	if p.cmd != nil {
 		s.terminateLocked(p, grace)
-	} // else: launch sees stopReq and never starts the process.
-	r := *p.run
+	} // else: launch honors stopReq before or right after starting.
 	s.mu.Unlock()
 	s.Log.Info("run stop requested", "run", id, "grace", grace)
 	return &r, nil
@@ -534,10 +562,13 @@ func (s *Supervisor) Shutdown(grace time.Duration) {
 	s.mu.Lock()
 	s.accepting = false
 	for _, p := range s.active {
-		p.stopReq = true
+		if p.exited {
+			continue
+		}
+		p.stopReq, p.stopGrace = true, grace
 		if p.cmd != nil {
 			s.terminateLocked(p, grace)
-		} // else: launch sees !accepting and never starts the process.
+		} // else: launch sees !accepting before or right after starting.
 	}
 	s.mu.Unlock()
 	done := make(chan struct{})

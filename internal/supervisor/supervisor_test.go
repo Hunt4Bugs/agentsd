@@ -347,6 +347,43 @@ func TestShutdownDuringLaunchNeverStartsProcess(t *testing.T) {
 	}
 }
 
+func TestCleanExitDuringReapKeepsStatus(t *testing.T) {
+	e := setup(t)
+	// Exits 0 at ~0.5s, leaving a helper that ignores SIGTERM, so the reap
+	// lasts the full grace. The 1s timeout and a stop both land mid-reap.
+	a := e.execAgent("x", `sh -c 'trap "" TERM; sleep 60' </dev/null >/dev/null 2>&1 & sleep 0.5; exit 0`)
+	r, err := e.sup.Start(StartRequest{Agent: a, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if _, err := e.sup.Stop(r.ID, time.Second); err != nil {
+		t.Fatalf("stop during reap: %v", err)
+	}
+	<-e.sup.Done(r.ID)
+	final, _ := e.sup.Store.Load(r.ID)
+	if final.Status != runstore.Succeeded || final.ExitCode == nil || *final.ExitCode != 0 {
+		code := "none"
+		if final.ExitCode != nil {
+			code = strconv.Itoa(*final.ExitCode)
+		}
+		t.Fatalf("clean exit recorded as %s (exit %s)", final.Status, code)
+	}
+}
+
+func TestStopDuringStartSignalsNewProcess(t *testing.T) {
+	e := setup(t)
+	e.sup.afterStart = func(id string) {
+		if _, err := e.sup.Stop(id, time.Second); err != nil {
+			t.Errorf("stop starting run: %v", err)
+		}
+	}
+	r := e.runToEnd(t, StartRequest{Agent: e.execAgent("x", "sleep 30")})
+	if r.Status != runstore.Stopped {
+		t.Fatalf("%+v", r)
+	}
+}
+
 func TestLeftoverGroupMembersAreReaped(t *testing.T) {
 	e := setup(t)
 	pidFile := filepath.Join(e.home, "bg.pid")
