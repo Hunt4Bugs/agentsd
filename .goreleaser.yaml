@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: agentsd
+
+before:
+  hooks:
+    - go mod tidy
+    - sh scripts/completions.sh
+
+builds:
+  - id: agentsd
+    main: ./cmd/agentsd
+    binary: agentsd
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/Hunt4Bugs/agentsd/internal/version.Version=v{{ .Version }}
+      - -X github.com/Hunt4Bugs/agentsd/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/Hunt4Bugs/agentsd/internal/version.Date={{ .Date }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - completions/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Keyless signing via GitHub OIDC: no signing secret to store. The bundle
+# carries both the signature and the certificate.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    artifacts: checksum
+
+homebrew_casks:
+  - name: agentsd
+    repository:
+      owner: Hunt4Bugs
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/Hunt4Bugs/agentsd
+    description: Run and supervise AI agents on a machine you own
+    license: Apache-2.0
+    completions:
+      bash: completions/agentsd.bash
+      zsh: completions/agentsd.zsh
+      fish: completions/agentsd.fish
+    # The binaries are not notarized in v0.1; clear the quarantine bit that
+    # cask downloads receive. No `service` stanza: the daemon is managed only
+    # by `agentsd service install` (one launchd label, one socket).
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/agentsd"]
+          end
+    caveats: |
+      Run `agentsd init`, `agentsd doctor`, then `agentsd service install`.
+      After upgrading, run `agentsd service restart`.
+
+release:
+  github:
+    owner: Hunt4Bugs
+    name: agentsd
+
+changelog:
+  use: github
