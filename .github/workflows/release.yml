@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # A release is published only if the acceptance checks pass on macOS arm64
+  # and Linux amd64 (spec §13.10).
+  acceptance:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: acceptance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # publish the GitHub release
+      id-token: write # cosign keyless signing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: sigstore/cosign-installer@v3
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Fine-grained token with contents:write on Hunt4Bugs/homebrew-tap.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

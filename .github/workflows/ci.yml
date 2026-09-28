@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS arm64 and Linux amd64: the release gate in spec §13.10.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: acceptance (e2e)
+        run: go test -tags e2e -count=1 -v ./test/e2e/
+      - name: install.sh against a mock release
+        run: sh test/install/run.sh
+      - name: static binary
+        if: runner.os == 'Linux'
+        run: |
+          CGO_ENABLED=0 go build -o /tmp/agentsd ./cmd/agentsd
+          file /tmp/agentsd | grep -q 'statically linked'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+      - name: shellcheck
+        # install.sh runs in users' shells; it is linted on every change.
+        run: shellcheck install.sh scripts/*.sh test/install/*.sh
+
+  release-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --snapshot --clean --skip=sign,publish
