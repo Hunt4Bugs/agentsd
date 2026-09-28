@@ -226,7 +226,7 @@ func (s *Supervisor) launch(p *proc, cfg *config.Config, timeout time.Duration) 
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = outputDrain
-	p.launchedAt = time.Now()
+	p.launchedAt = policy.FSNow(s.Dirs.State())
 	if err := cmd.Start(); err != nil {
 		return err
 	}

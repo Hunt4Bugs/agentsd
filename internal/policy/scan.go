@@ -7,6 +7,7 @@ package policy
 import (
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"time"
@@ -144,4 +145,21 @@ func dedupeRoots(roots []string) []string {
 		}
 	}
 	return out
+}
+
+// FSNow returns "now" as the filesystem will stamp it, by touching a probe
+// file in dir. Linux stamps mtimes from a coarse kernel clock that can lag
+// time.Now() by a few milliseconds, so a window opened with time.Now() would
+// miss writes made right after it. Falls back to time.Now() on error.
+func FSNow(dir string) time.Time {
+	now := time.Now()
+	p := filepath.Join(dir, ".agentsd-clock")
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		return now
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.ModTime().After(now) {
+		return now
+	}
+	return fi.ModTime()
 }

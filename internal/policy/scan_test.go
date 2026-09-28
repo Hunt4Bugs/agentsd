@@ -20,9 +20,9 @@ func TestScan(t *testing.T) {
 
 	// Written moments before the run in the same second: not the run's.
 	os.WriteFile(filepath.Join(src, "just-before.txt"), []byte("x"), 0o644)
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
 
-	start := time.Now()
+	start := FSNow(t.TempDir())
 	os.WriteFile(filepath.Join(src, "deep", "bad.txt"), []byte("x"), 0o644)
 	os.WriteFile(filepath.Join(wiki, "research", "ok.md"), []byte("x"), 0o644)
 	os.WriteFile(filepath.Join(out, "ok.txt"), []byte("x"), 0o644)
